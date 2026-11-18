@@ -1,5 +1,24 @@
 # github-core-clone-01 v4 — STATE
 
+> REWRITE (2026-11-19, fresh opencode DB, SPEC-only): the first v4 code passed
+> `makefun check` on everything EXCEPT `thinking_reproduces` (4.0% — the
+> builders had read the v3 reference files, so nearly every line counted as
+> "read"/"copied", not authored). All six .ts files were rewritten from
+> scratch by opencode builders who never read any existing implementation
+> (SPEC + kit docs only, prose contracts for cross-module names). The code
+> below is the rewrite; the trial scores in the history section are from the
+> FIRST v4 code and must be re-verified (see the verification run below).
+> Sessions in the fresh DB: (a) store+main, (b) git+cache, (c) rest (first
+> attempt wrote to the v3 dir by mistake, killed, v3 file restored from git;
+> second attempt correct), (d) graphql (+fix: mangled line 988, missing
+> handleGraphQL entrypoint), (e) mcp, (f) verification. Fixes applied during
+> the rewrite: GitService/RestArgs/GraphQLArgs/McpArgs/User/Repo must be
+> `import type` in main.ts (type-only exports fail at runtime under
+> --experimental-strip-types); heredoc shell writes DO count as authored
+> (the kit's shellOps extracts heredoc bodies), so (d)/(e) heredoc pieces
+> are fine.
+
+
 Account: **@daggerdash** (acct wallet `4JQLJZgYPfcg38bSvRRDWFrkVVdUrfLFSh8ZwzjhY3n2`,
 agent wallet `51DE4Zuf7r9NJbMfuMecxt3zJPyRi7XEUVwHtUenqTBg`).
 Repo: https://github.com/Plowester1/github-core-clone-01-v4 (branch `main`).

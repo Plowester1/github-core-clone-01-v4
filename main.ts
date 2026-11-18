@@ -1,5 +1,8 @@
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { isoOf, type Store, type User } from './store.ts';
+import { createServer, type Server } from 'node:http';
+import { pathToFileURL } from 'node:url';
+
+import { isoOf, Store } from './store.ts';
+import type { User, Repo } from './store.ts';
 import {
   advertiseV0,
   advertiseV2,
@@ -8,197 +11,323 @@ import {
   parseFetchRequest,
   parseLsRefsRequest,
   receivePack,
-  type GitService,
 } from './git.ts';
-import { getRepo, handleRest, sendJson } from './rest.ts';
+import type { GitService } from './git.ts';
+import { getRepo, handleRest } from './rest.ts';
+import type { RestArgs } from './rest.ts';
 import { handleGraphQL } from './graphql.ts';
+import type { GraphQLArgs } from './graphql.ts';
 import { handleMcp } from './mcp.ts';
+import type { McpArgs } from './mcp.ts';
+
+const VIEWER_LOGIN = 'adaiversen';
 
 export interface RunningServer {
   server: Server;
   port: number;
 }
 
-function buildStore(): Store {
-  const epochSec = 1700000000;
-  const viewer: User = { id: 1, login: 'adaiversen', name: 'Ada Iversen', email: 'adaiversen@example.invalid' };
-  return {
-    nextUserId: 2,
-    nextRepoId: 1,
-    nextIssueId: 1,
-    nextPullId: 1,
-    nextCommentId: 1,
-    users: new Map<string, User>([[viewer.login, viewer]]),
-    repos: new Map(),
-    viewer,
-    epochSec,
-    nowIso: isoOf(epochSec),
-  };
+const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
+
+function expectedToken(): string {
+  return process.env.MAKEFUN_SHOP_TOKEN ?? '';
 }
 
-const store = buildStore();
+function bearerOf(req: { headers: Record<string, string | undefined> }): string {
+  const h = req.headers['authorization'] ?? '';
+  if (h.startsWith('Bearer ')) return h.slice(7);
+  if (h.startsWith('bearer ')) return h.slice(7);
+  return '';
+}
 
-async function readBody(req: IncomingMessage): Promise<Buffer> {
+function tokenOk(token: string): boolean {
+  const expected = expectedToken();
+  if (expected === '') return true;
+  return token === expected;
+}
+
+function currentViewerToken(): string {
+  return expectedToken();
+}
+
+let requestIdCounter = 0;
+
+function nextRequestId(): string {
+  requestIdCounter += 1;
+  return String(requestIdCounter);
+}
+
+async function readBody(req: { headers: Record<string, string | undefined> }, res: {
+  emit: (ev: string, err: Error) => boolean;
+}): Promise<Buffer> {
   const chunks: Buffer[] = [];
-  for await (const chunk of req) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-  if (chunks.length === 1) return chunks[0];
-  return Buffer.concat(chunks);
+  let total = 0;
+  for await (const chunk of req) {
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    chunks.push(buf);
+    total += buf.length;
+  }
+  return Buffer.concat(chunks, total);
 }
 
-function bearerToken(req: IncomingMessage): string {
-  const header = req.headers.authorization;
-  if (typeof header !== 'string') return '';
-  return header.toLowerCase().startsWith('bearer ') ? header.slice(7).trim() : header.trim();
-}
-
-function isAuthorized(req: IncomingMessage): boolean {
-  const expected = process.env.MAKEFUN_SHOP_TOKEN;
-  if (expected === undefined || expected === '') return true;
-  return bearerToken(req) === expected;
-}
-
-interface GitParts {
-  owner: string;
-  repo: string;
-  operation: string;
-}
-
-function gitParts(pathname: string): GitParts | null {
-  const parts = pathname.split('/').filter(Boolean);
-  if (parts.length < 3) return null;
-  const operation = parts.slice(2).join('/');
-  if (operation !== 'info/refs' && operation !== 'git-upload-pack' && operation !== 'git-receive-pack') return null;
-  return { owner: parts[0], repo: parts[1].replace(/\.git$/, ''), operation };
-}
-
-function sendGitBuffer(res: ServerResponse, status: number, contentType: string, body: Buffer): void {
-  res.writeHead(status, { 'content-type': contentType, 'content-length': body.length });
+function sendJson(res: {
+  writeHead: (code: number, headers: Record<string, string | number>) => void;
+  end: (data: string) => void;
+}, status: number, payload: unknown, extraHeaders: Record<string, string> = {}): void {
+  const body = JSON.stringify(payload);
+  const headers: Record<string, string | number> = {
+    'content-type': 'application/json',
+    'content-length': Buffer.byteLength(body),
+    'x-github-request-id': nextRequestId(),
+    ...extraHeaders,
+  };
+  res.writeHead(status, headers);
   res.end(body);
 }
 
-function handleGitHttp(req: IncomingMessage, res: ServerResponse, url: URL, body: Buffer, parts: GitParts): void {
-  const repo = getRepo(store, parts.owner, parts.repo);
-  if (repo === null) {
+function sendBuffer(res: {
+  writeHead: (code: number, headers: Record<string, string | number>) => void;
+  end: (data: Buffer | string) => void;
+}, status: number, body: Buffer, extraHeaders: Record<string, string> = {}): void {
+  const headers: Record<string, string | number> = {
+    'content-length': body.length,
+    ...extraHeaders,
+  };
+  res.writeHead(status, headers);
+  res.end(body);
+}
+
+function pathSegments(url: string): string[] {
+  const u = url.split('?')[0] ?? '';
+  return u.split('/').filter((s) => s !== '' && s !== '.' && s !== '..');
+}
+
+async function handleGit(
+  store: Store,
+  segs: string[],
+  method: string,
+  url: string,
+  req: { headers: Record<string, string | undefined>; url?: string },
+  res: { writeHead: (code: number, headers: Record<string, string | number>) => void; end: (data: Buffer | string) => void },
+  service: GitService,
+): Promise<void> {
+  const baseSegs = segs.filter((s) => !s.endsWith('.git'));
+  const operation = segs.length > MI ? segs[MI] : '';
+  if (operation === 'info/refs') {
+    const q = new URL(req.url ?? url, 'http://x').searchParams;
+    const serviceParam = q.get('service');
+    const gitProtocol = req.headers['git-protocol'] ?? '';
+    let advertised: Buffer;
+    if (serviceParam === 'git-upload-pack' && gitProtocol === 'version=2') {
+      advertised = advertiseV2(store, baseSegs[0], baseSegs[1]);
+    } else if (serviceParam === 'git-upload-pack') {
+      advertised = advertiseV0(store, baseSegs[0], baseSegs[1], 'git-upload-pack');
+    } else if (serviceParam === 'git-receive-pack') {
+      advertised = advertiseV0(store, baseSegs[0], baseSegs[1], 'git-receive-pack');
+    } else {
+      advertised = advertiseV0(store, baseSegs[0], baseSegs[1], 'git-upload-pack');
+    }
+    const headers: Record<string, string | number> = {
+      'content-type': `application/x-${serviceParam ?? 'git-upload-pack'}-advertisement`,
+      'content-length': advertised.length,
+      'cache-control': 'no-cache',
+    };
+    res.writeHead(200, headers);
+    res.end(advertised);
+    return;
+  }
+  if (operation === 'git-upload-pack') {
+    const body = await readBody(req as never, res as never);
+    const parsed = parseFetchRequest(body);
+    const resp = await fetchResponse(store, baseSegs[0], baseSegs[1], parsed);
+    const headers: Record<string, string | number> = {
+      'content-type': `application/x-git-upload-pack-result`,
+      'content-length': resp.length,
+    };
+    res.writeHead(200, headers);
+    res.end(resp);
+    return;
+  }
+  if (operation === 'git-receive-pack') {
+    const body = await readBody(req as never, res as never);
+    const report = await receivePack(store, baseSegs[0], baseSegs[1], body, {
+      userLogin: VIEWER_LOGIN,
+    });
+    const headers: Record<string, string | number> = {
+      'content-type': `application/x-git-receive-pack-result`,
+      'content-length': report.length,
+    };
+    res.writeHead(200, headers);
+    res.end(report);
+    return;
+  }
+  if (operation === 'git-upload-pack' || operation === 'info/refs') {
+    return;
+  }
+  sendJson(res, 404, { message: 'Not Found' });
+}
+
+const MI = 2;
+
+function methodOf(req: { method?: string }): string {
+  return (req.method ?? 'GET').toUpperCase();
+}
+
+async function dispatch(
+  req: { headers: Record<string, string | undefined>; url?: string; method?: string },
+  res: { writeHead: (code: number, headers: Record<string, string | number>) => void; end: (data: Buffer | string) => void },
+  store: Store,
+): Promise<void> {
+  const method = methodOf(req);
+  const url = req.url ?? '/';
+  const segs = pathSegments(urlFormat(url));
+  const token = bearerOf(req);
+
+  if (segs.length === 0 || segs[0] === 'healthz') {
+    if (method === 'GET') {
+      sendJson(res, 200, { ok: true });
+    } else {
+      sendJson(res, 405, { message: 'Method Not Allowed' });
+    }
+    return;
+  }
+
+  const first = segs[0];
+  if (first === 'api') {
+    if (segs[1] === 'graphql') {
+      if (!tokenOk(token)) { sendJson(res, 401, { message: 'Bad credentials' }); return; }
+      const body = method === 'POST' ? await readBody(req as never, res as never) : Buffer.alloc(0);
+      const args: GraphQLArgs = {
+        method,
+        body: body.toString('utf8'),
+        token,
+        origin: '',
+        store,
+      };
+      await handleGraphQL(args, req, res);
+      return;
+    }
+    if (segs[1] === 'v3' || segs[1] === 'v2' || segs[1] === 'v1' || segs[1] === undefined) {
+      if (segs[1] === 'v3') {
+        const restSegs = segs.slice(2);
+        await dispatchRest(method, restSegs, url, token, req, res, store);
+        return;
+      }
+      const restSegs = segs.slice(1);
+      await dispatchRest(method, restSegs, url, token, req, res, store);
+      return;
+    }
     sendJson(res, 404, { message: 'Not Found' });
     return;
   }
-  const requestedService: GitService = parts.operation === 'git-receive-pack' ? 'git-receive-pack' : 'git-upload-pack';
-  const protocol = req.headers['git-protocol'];
-  const versionTwo = typeof protocol === 'string' && protocol.split(',').some((item) => item.trim() === 'version=2');
 
-  if (parts.operation === 'info/refs') {
-    const queryService = url.searchParams.get('service');
-    const service: GitService = queryService === 'git-receive-pack' ? 'git-receive-pack' : requestedService;
-    const advertisement = versionTwo ? advertiseV2(repo, service) : advertiseV0(repo, service);
-    sendGitBuffer(res, 200, `application/x-${service}-advertisement`, advertisement);
+  if (first === 'user' || first === 'repos' || first === 'meta' || first === 'rate_limit') {
+    await dispatchRest(method, segs, url, token, req, res, store);
     return;
   }
-  if (req.method !== 'POST') {
-    sendJson(res, 405, { message: 'Method Not Allowed' });
+
+  if (first === 'graphql') {
+    if (!tokenOk(token)) { sendJson(res, 401, { message: 'Bad credentials' }); return; }
+    const body = method === 'POST' ? await readBody(req as never, res as never) : Buffer.alloc(0);
+    const args: GraphQLArgs = { method, body: body.toString('utf8'), token, origin: '', store };
+    await handleGraphQL(args, req, res);
     return;
   }
-  if (parts.operation === 'git-receive-pack') {
-    sendGitBuffer(res, 200, 'application/x-git-receive-pack-result', receivePack(repo, body));
+
+  if (first === 'mcp') {
+    await handleMcp({ method, body: '', token, headers: req.headers, store } as McpArgs, req, res);
     return;
   }
-  const lsRefsArgs = parseLsRefsRequest(body);
-  if (lsRefsArgs !== null) {
-    sendGitBuffer(res, 200, 'application/x-git-upload-pack-result', lsRefsV2(repo, lsRefsArgs));
+
+  if (segs.length >= 2) {
+    await handleGit(store, segs, method, url, req, res, 'git-upload-pack');
     return;
   }
-  const request = parseFetchRequest(body, versionTwo);
-  sendGitBuffer(res, 200, 'application/x-git-upload-pack-result', fetchResponse(repo, request, versionTwo));
+
+  sendJson(res, 404, { message: 'Not Found' });
 }
 
-function restSegments(pathname: string): string[] {
-  let path = pathname;
-  if (path.startsWith('/api/v3')) path = path.slice('/api/v3'.length);
-  else if (path.startsWith('/api/')) path = path.slice('/api/'.length);
-  return path.split('/').filter(Boolean).map((part) => decodeURIComponent(part));
+async function dispatchRest(
+  method: string,
+  restSegs: string[],
+  url: string,
+  token: string,
+  req: { headers: Record<string, string | undefined>; url?: string },
+  res: { writeHead: (code: number, headers: Record<string, string | number>) => void; end: (data: Buffer | string) => void },
+  store: Store,
+): Promise<void> {
+  if (!tokenOk(token)) {
+    sendJson(res, 401, { message: 'Bad credentials' });
+    return;
+  }
+  const bodyStr = (method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE')
+    ? (await readBody(req as never, res as never)).toString('utf8')
+    : '';
+  const u = new URL(req.url ?? url, 'http://x');
+  const args: RestArgs = {
+    method,
+    segments: restSegs,
+    query: u.searchParams,
+    body: bodyStr,
+    token,
+    origin: '',
+  };
+  const r = await handleRest(store, args);
+  const status = r.status;
+  const headers: Record<string, string | number> = {
+    'content-type': r.contentType ?? 'application/json',
+    'x-github-request-id': nextRequestId(),
+  };
+  if (r.headers) {
+    for (const [k, v] of Object.entries(r.headers)) headers[k] = v;
+  }
+  if (r.bodyBuffer) {
+    headers['content-length'] = r.bodyBuffer.length;
+    res.writeHead(status, headers);
+    res.end(r.bodyBuffer);
+  } else {
+    const payload = typeof r.body === 'string' ? r.body : JSON.stringify(r.body ?? {});
+    headers['content-length'] = Buffer.byteLength(payload);
+    res.writeHead(status, headers);
+    res.end(payload);
+  }
 }
 
-function buildServer(): Server {
-  let requestCounter = 0;
-  return createServer((req, res) => {
-    void (async () => {
-      res.setHeader('x-github-request-id', String(++requestCounter));
-      const method = req.method ?? 'GET';
-      const body =
-        method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE'
-          ? await readBody(req)
-          : Buffer.alloc(0);
-      const url = new URL(req.url ?? '/', 'http://127.0.0.1');
-      const pathname = url.pathname;
+function urlFormat(url: string): string {
+  return url;
+}
 
-      if (pathname === '/healthz') {
-        res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-        res.end('{"ok":true}');
-        return;
+export async function startServer(opts: {
+  host?: string;
+  port?: number;
+  store?: Store;
+} = {}): Promise<RunningServer> {
+  const store = opts.store ?? new Store();
+  const server = createServer(async (req, res) => {
+    try {
+      await dispatch(req, res, store);
+    } catch (err) {
+      try {
+        sendJson(res, 500, { message: err instanceof Error ? err.message : String(err) });
+      } catch {
+        // response already sent
       }
-      if (!isAuthorized(req)) {
-        sendJson(res, 401, { message: 'Unauthorized' });
-        return;
-      }
-      if (pathname === '/api/graphql' || pathname === '/graphql') {
-        handleGraphQL(store, { method, body: body.toString('utf8'), token: bearerToken(req) }, res);
-        return;
-      }
-      if (pathname === '/mcp') {
-        handleMcp(store, { method, body: body.toString('utf8'), headers: req.headers }, res);
-        return;
-      }
-      const git = gitParts(pathname);
-      if (git !== null) {
-        handleGitHttp(req, res, url, body, git);
-        return;
-      }
-      if (
-        pathname === '/api/v3' ||
-        pathname.startsWith('/api/') ||
-        pathname.startsWith('/user') ||
-        pathname.startsWith('/repos') ||
-        pathname.startsWith('/meta') ||
-        pathname.startsWith('/rate_limit')
-      ) {
-        handleRest(
-          store,
-          {
-            method,
-            segments: restSegments(pathname),
-            query: url.searchParams,
-            body: body.toString('utf8'),
-            token: bearerToken(req),
-            origin: `http://${req.headers.host ?? '127.0.0.1'}`,
-          },
-          res
-        );
-        return;
-      }
-      sendJson(res, 404, { message: 'Not Found' });
-    })().catch(() => {
-      if (!res.headersSent) sendJson(res, 400, { message: 'Bad Request' });
-      else res.end();
-    });
+    }
   });
-}
-
-export function startServer(): Promise<RunningServer> {
-  const server = buildServer();
-  return new Promise((resolve, reject) => {
-    const onError = (error: Error): void => reject(error);
-    server.once('error', onError);
-    server.listen(0, '127.0.0.1', () => {
-      server.off('error', onError);
-      const address = server.address();
-      const port = typeof address === 'object' && address !== null ? address.port : 0;
-      resolve({ server, port });
-    });
+  const host = opts.host ?? (ENV_URL !== '' ? '127.0.0.1' : undefined);
+  const port = opts.port ?? 0;
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(port, host, () => resolve());
   });
+  const address = server.address();
+  if (address === null || typeof address === 'string') throw new Error('server did not bind a TCP port');
+  return { server, port: address.port };
 }
 
+const REQUEST_TIMEOUT_MS = 30_000;
 const RETRY_INITIAL_MS = 250;
 const RETRY_MAX_MS = 2_000;
-const REQUEST_TIMEOUT_MS = 30_000;
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -206,10 +335,10 @@ function retryDelay(attempt: number): number {
   return Math.min(RETRY_MAX_MS, RETRY_INITIAL_MS * 2 ** Math.min(attempt, 8));
 }
 
-async function register(envUrl: string, port: number): Promise<void> {
+async function register(port: number): Promise<void> {
   for (let attempt = 0; ; attempt += 1) {
     try {
-      const res = await fetch(`${envUrl}/register`, {
+      const res = await fetch(`${ENV_URL}/register`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ port }),
@@ -226,41 +355,49 @@ async function register(envUrl: string, port: number): Promise<void> {
   }
 }
 
-async function waitForDone(envUrl: string): Promise<void> {
+async function waitForDone(): Promise<void> {
   for (let attempt = 0; ; attempt += 1) {
     try {
-      const res = await fetch(`${envUrl}/done`, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+      const res = await fetch(`${ENV_URL}/done`, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
       if (res.ok) {
-        const parsed = (await res.json()) as { done?: unknown };
-        if (parsed.done === true) return;
+        const body = (await res.json()) as { done?: unknown };
+        if (body.done === true) return;
       }
     } catch {
-      // env not answering or poll timed out — poll again
+      // not done yet; poll again
     }
     await sleep(retryDelay(attempt));
   }
 }
 
-async function lifecycle(): Promise<void> {
-  const envUrl = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
-  if (envUrl === '') {
+async function main(): Promise<void> {
+  if (ENV_URL !== '') {
     const { server, port } = await startServer();
-    process.stdout.write(`PORT=${port}\n`);
-    await new Promise<void>((resolve) => server.on('close', resolve));
+    process.stdout.write(`[entry] listening on port ${port}\n`);
+    await register(port);
+    process.stdout.write('[entry] registered; waiting for the env to say done\n');
+    await waitForDone();
+    server.close();
+    process.stdout.write('[entry] done\n');
+    process.exit(0);
     return;
   }
   const { server, port } = await startServer();
-  await register(envUrl, port);
-  await waitForDone(envUrl);
-  server.close();
+  process.stdout.write(`PORT=${port}\n`);
+  await new Promise<void>((resolve) => {
+    const shutdown = () => server.close(() => resolve());
+    process.on('SIGTERM', shutdown);
+    process.on('SIGINT', shutdown);
+  });
+  process.exit(0);
 }
 
-const isMain = process.argv[1] !== undefined && import.meta.url === new URL(`file://${process.argv[1]}`).href;
+const isMain = typeof require !== 'undefined' && require.main === module
+  ? true
+  : process.argv[1] !== undefined && pathToFileURL(process.argv[1]).href === import.meta.url;
 if (isMain) {
-  lifecycle()
-    .then(() => process.exit(0))
-    .catch((err) => {
-      process.stderr.write(`[entry] ${err instanceof Error ? err.message : String(err)}\n`);
-      process.exit(1);
-    });
+  main().catch((err) => {
+    process.stderr.write(`[entry] ${err instanceof Error ? err.message : String(err)}\n`);
+    process.exit(1);
+  });
 }
