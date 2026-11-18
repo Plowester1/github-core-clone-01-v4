@@ -1,0 +1,9 @@
+node_modules/
+server-*.log
+trial-*.log
+server-t4.port
+bench-after-run*.json
+bench-perf.ts
+diag-perf.ts
+smoke-test.sh
+perf-round6.md
