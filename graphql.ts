@@ -110,6 +110,11 @@ function tokenize(src: string): Token[] {
       toks.push({ type: 'name', value: val, start: i });
       continue;
     }
+    if (c === '.' && src[i + 1] === '.' && src[i + 2] === '.') {
+      toks.push({ type: 'punct', value: '...', start: i });
+      i += 3;
+      continue;
+    }
     toks.push({ type: 'punct', value: c, start: i });
     i++;
   }
@@ -155,7 +160,7 @@ function parseValue(p: Parser): unknown {
     if (t.value === 'true') return true;
     if (t.value === 'false') return false;
     if (t.value === 'null') return null;
-    throw new Error('unexpected name ' + t.value);
+    return t.value;
   }
   if (t.type === 'punct' && t.value === '[') {
     const arr: unknown[] = [];
@@ -163,7 +168,7 @@ function parseValue(p: Parser): unknown {
     while (true) {
       arr.push(parseValue(p));
       if (peek(p).type === 'punct' && peek(p).value === ']') { next(p); break; }
-      expectPunct(p, ',');
+      if (peek(p).type === 'punct' && peek(p).value === ',') { next(p); continue; }
     }
     return arr;
   }
@@ -174,6 +179,7 @@ function parseValue(p: Parser): unknown {
       if (key.type === 'string') {
         expectPunct(p, ':');
         obj[key.value] = parseValue(p);
+        if (peek(p).type === 'punct' && peek(p).value === ',') next(p);
       } else if (key.type === 'punct' && key.value === '}') {
         break;
       } else {
@@ -215,7 +221,7 @@ function parseField(p: Parser): FieldNode {
       expectPunct(p, ':');
       args[an.value] = parseValue(p);
       if (peek(p).type === 'punct' && peek(p).value === ')') { next(p); break; }
-      expectPunct(p, ',');
+      if (peek(p).type === 'punct' && peek(p).value === ',') { next(p); continue; }
     }
   }
   while (peek(p).type === 'punct' && peek(p).value === '@') {
@@ -231,7 +237,7 @@ function parseField(p: Parser): FieldNode {
           expectPunct(p, ':');
           args[an.value] = parseValue(p);
           if (peek(p).type === 'punct' && peek(p).value === ')') { next(p); break; }
-          expectPunct(p, ',');
+          if (peek(p).type === 'punct' && peek(p).value === ',') { next(p); continue; }
         }
       }
     }
@@ -264,6 +270,13 @@ function parseSelectionSet(p: Parser): FieldNode[] {
       } else {
         const frag = next(p);
         if (frag.type !== 'name') throw new Error('expected fragment name');
+        if (frag.value === 'on') {
+          const typeName = next(p);
+          if (typeName.type !== 'name') throw new Error('expected inline fragment type');
+          const spread = parseSelectionSet(p);
+          for (const f of spread) fields.push(f);
+          continue;
+        }
         const spread = parseSelectionSet(p);
         const v = validateFrag(p, frag.value, spread);
         for (const f of v) fields.push(f);
@@ -326,14 +339,14 @@ function parseDocument(src: string, variables: Map<string, unknown>): OpNode {
     const fields = parseSelectionSet(p);
     return { name: on.value, op: 'query', vars: variables, fields };
   }
+  if (peek(p).type === 'punct' && peek(p).value === '{') {
+    const fields = parseSelectionSet(p);
+    return { name: '', op: 'query', vars: variables, fields };
+  }
   const opTok = next(p);
   let op = 'query';
   if (opTok.type === 'name') {
     if (opTok.value === 'query' || opTok.value === 'mutation') op = opTok.value;
-  }
-  if (peek(p).type === 'punct' && peek(p).value === '{') {
-    const fields = parseSelectionSet(p);
-    return { name: '', op, vars: variables, fields };
   }
   const on = next(p);
   if (on.type !== 'name') throw new Error('expected operation name');
@@ -492,6 +505,13 @@ function resolveRepo(repo: any): any {
     updatedAt: repo.updatedAt,
     pushedAt: repo.pushedAt,
     size: repo.size,
+    owner: repo.owner,
+    defaultBranch: repo.defaultBranch,
+    headOid: repo.headOid,
+    issues: repo.issues || [],
+    pulls: repo.pulls || [],
+    issueByNumber: repo.issueByNumber || new Map(),
+    pullByNumber: repo.pullByNumber || new Map(),
   };
 }
 
@@ -519,7 +539,9 @@ function resolveField(field: FieldNode, ctx: { store: Store; parent: any; parent
   // object field
   switch (parentType) {
     case 'Query': return resolveQueryField(field, store);
-    case 'Mutation': return resolveMutationField(field, store);
+    case 'Mutation':
+      if (field.sub !== null && parent != null && parent[field.name] !== undefined) return parent[field.name];
+      return resolveMutationField(field, store);
     case 'Repository': {
       const repo = parent;
       switch (name) {
