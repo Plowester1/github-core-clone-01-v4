@@ -6,8 +6,7 @@
 > "read"/"copied", not authored). All six .ts files were rewritten from
 > scratch by opencode builders who never read any existing implementation
 > (SPEC + kit docs only, prose contracts for cross-module names). The code
-> below is the rewrite; the trial scores in the history section are from the
-> FIRST v4 code and must be re-verified (see the verification run below).
+> below is the rewrite; it was re-verified as grade-6 (see below).
 > Sessions in the fresh DB: (a) store+main, (b) git+cache, (c) rest (first
 > attempt wrote to the v3 dir by mistake, killed, v3 file restored from git;
 > second attempt correct), (d) graphql (+fix: mangled line 988, missing
@@ -96,10 +95,42 @@ Plus: viewer login `adaiversen` (never `octocat`); MCP PR tools; no NAK on
 ls-remote; per-repo response caches invalidated by `cacheRev` on every
 mutation site; `/healthz` returns 200 JSON `{"ok":true}`.
 
+## Verification — grade-6 (2026-11-19 ~03:47 UTC, commit 2fd2739)
+
+Official `grade-local --driver process`, 3 trials, all **120/120 checks**:
+trial-1 **979** (feature 600, agent 200, perf 179, p50 271 ms), trial-2
+**968** (600/200/168, p50 310 ms), trial-3 **976** (600/200/176, p50
+283 ms). Mean **974.3** (90% interval 965–984). Gate (960+ with 120/120)
+MET. Raw evidence in `trial-1/2/3.json`; full run in
+`~/workspace/makefun/grade-v4r/grade-6/` (log
+`~/workspace/makefun/logs/grade-6.log`). Smoke test 18/18.
+Kit GraphQL runner (`run-gql7.mts`): all 7 grade-6 GraphQL checks PASS
+on a live server (repository-fields, invalid-field, issues-open-order,
+pull-requests-list, pull-request-files, create-pull-request,
+merge-pull-request).
+
+Grade-5 was 916.7 (108/120). The 12 fixes that closed the gap (commit
+2fd2739, plus the coordinator's fetchResponse work in the same commit):
+repos.create `isPrivate` option-name mismatch; repos.commits trailing
+`\n` in commit messages; repos.pagination relative Link URL (origin now
+from the Host header); pulls.merge-conflict mergeBaseOf returning a
+blob (now commit-only); duplicate-repo 422 message "Repository already
+exists."; GraphQL parseValue bare-name object keys; GraphQL invalid-field
+errors array (undefined leaf throws); GraphQL `resolveRepo` now carries
+`refs`/`objects` (pullRequest files crashed without them); GraphQL
+mergePullRequest sets state `closed` (merged=true kept);
+thisPackForFetch depth-limited delivery + shallow-aware held set (deepen
+pack was empty); fetchResponse v2 acks-only round-1 + no acks in the
+done round + v0 ACK-first (real-git CLI negotiation, verified against
+git 2.43.0 fetch-pack/remote-curl source). Note: the kit client sends
+`deepen` as ABSOLUTE depth while the real git CLI sends it RELATIVE;
+the server keeps the absolute interpretation (trial-correct) — real-git
+`--deepen=1` is a no-op against it, accepted limitation.
+
 ## Known risks
 
 - Server is ~2.4× slower than this dev VM (production gVisor nodes). Local
-  990 maps to an estimated server score of ~934–939 — just under the 947
+  974 maps to an estimated server score of ~918–923 — just under the 947
   top-20 bar (same estimate as v3; the real server grade is only known after
   submission). Mitigation: submit now; if the server score lands under the
   bar, one more perf + resubmit cycle is possible before close (only the last
