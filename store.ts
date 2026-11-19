@@ -18,7 +18,7 @@ export function hashObject(type: GitObjectType, data: Buffer): string {
 
 export interface TreeEntry {
   name: string;
-  mode: number;
+  mode: string;
   oid: string;
 }
 
@@ -39,7 +39,7 @@ export function compareTreeNames(a: string, b: string): number {
 
 export function sortTreeEntries(entries: TreeEntry[]): TreeEntry[] {
   const decorated = entries.map((e) => {
-    const isDir = e.mode === 0o40000;
+    const isDir = e.mode === '40000';
     return { entry: e, key: isDir ? `${e.name}/` : e.name };
   });
   decorated.sort((a, b) => {
@@ -54,7 +54,7 @@ export function buildTree(entries: TreeEntry[]): Buffer {
   const sorted = sortTreeEntries(entries);
   const parts: Buffer[] = [];
   for (const e of sorted) {
-    const mode = e.mode.toString(8);
+    const mode = typeof e.mode === 'number' ? e.mode.toString(8) : e.mode;
     parts.push(Buffer.from(`${mode} ${e.name}`, 'utf8'));
     parts.push(Buffer.from([0x00]));
     parts.push(Buffer.from(e.oid, 'hex'));
@@ -68,7 +68,7 @@ export function parseTree(data: Buffer): TreeEntry[] {
   while (pos < data.length) {
     const spaceIdx = data.indexOf(0x20, pos);
     if (spaceIdx < 0) break;
-    const mode = parseInt(data.slice(pos, spaceIdx).toString('utf8'), 8);
+    const mode = data.slice(pos, spaceIdx).toString('utf8');
     const nulIdx = data.indexOf(0x00, spaceIdx);
     if (nulIdx < 0) break;
     const name = data.slice(spaceIdx + 1, nulIdx).toString('utf8');

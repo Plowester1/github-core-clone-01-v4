@@ -1,4 +1,4 @@
-import { Store, bumpRepoCache } from "./store.ts";
+import { Store, bumpRepoCache, hashObject } from "./store.ts";
 import type { Repo } from "./store.ts";
 import { isAncestor } from "./git.ts";
 
@@ -36,6 +36,13 @@ function rpcError(id: any, code: number, message: string, data?: any): string {
   const obj: any = { jsonrpc: "2.0", id: id ?? null, error: { code, message } };
   if (data !== undefined) obj.error.data = data;
   return JSON.stringify(obj);
+}
+
+function toolResult(id: any, value: any): string {
+  return rpcResult(id, {
+    content: [{ type: "text", text: JSON.stringify(value) }],
+    structuredContent: value,
+  });
 }
 
 function repoResult(repo: Repo): any {
@@ -351,7 +358,7 @@ function findRepo(store: Store, fullName: string): Repo | undefined {
   return store.repos.get(fullName) || store.repos.get("adaiversen/" + fullName);
 }
 
-function toolReposCreate(store: Store, p: any): string {
+function toolReposCreate(id: any, store: Store, p: any): string {
   const owner = String(p.owner || "adaiversen");
   const name = String(p.name);
   const repo = store.createRepo(owner, name, {
@@ -359,37 +366,37 @@ function toolReposCreate(store: Store, p: any): string {
     private: p.private !== undefined ? Boolean(p.private) : undefined,
     defaultBranch: p.default_branch !== undefined ? String(p.default_branch) : undefined,
   });
-  return rpcResult(null, repoResult(repo));
+  return toolResult(id, repoResult(repo));
 }
 
-function toolReposList(store: Store, p: any): string {
+function toolReposList(id: any, store: Store, p: any): string {
   const repos = [...store.repos.values()].map(repoResult);
-  return rpcResult(null, repos);
+  return toolResult(id, repos);
 }
 
-function toolReposGet(store: Store, p: any): string {
+function toolReposGet(id: any, store: Store, p: any): string {
   const repo = findRepo(store, String(p.full_name || ""));
-  if (!repo) return rpcError(null, -32002, "Repository not found: " + p.full_name);
-  return rpcResult(null, repoResult(repo));
+  if (!repo) return rpcError(id, -32002, "Repository not found: " + p.full_name);
+  return toolResult(id, repoResult(repo));
 }
 
-function toolBranchesList(store: Store, p: any): string {
+function toolBranchesList(id: any, store: Store, p: any): string {
   const repo = findRepo(store, String(p.full_name || ""));
-  if (!repo) return rpcError(null, -32002, "Repository not found: " + p.full_name);
-  return rpcResult(null, repoBranchList(repo));
+  if (!repo) return rpcError(id, -32002, "Repository not found: " + p.full_name);
+  return toolResult(id, repoBranchList(repo));
 }
 
-function toolCommitsList(store: Store, p: any): string {
+function toolCommitsList(id: any, store: Store, p: any): string {
   const repo = findRepo(store, String(p.full_name || ""));
-  if (!repo) return rpcError(null, -32002, "Repository not found: " + p.full_name);
+  if (!repo) return rpcError(id, -32002, "Repository not found: " + p.full_name);
   const perPage = Math.max(1, Math.min(100, Number(p.per_page) || 30));
   const branch = p.branch !== undefined ? String(p.branch) : undefined;
-  return rpcResult(null, repoCommitList(repo, branch, perPage));
+  return toolResult(id, repoCommitList(repo, branch, perPage));
 }
 
-function toolIssuesCreate(store: Store, p: any): string {
+function toolIssuesCreate(id: any, store: Store, p: any): string {
   const repo = findRepo(store, String(p.full_name || ""));
-  if (!repo) return rpcError(null, -32002, "Repository not found: " + p.full_name);
+  if (!repo) return rpcError(id, -32002, "Repository not found: " + p.full_name);
   const title = String(p.title);
   const body = p.body !== undefined ? String(p.body) : "";
   const labels = Array.isArray(p.labels) ? p.labels.map(String) : [];
@@ -416,40 +423,40 @@ function toolIssuesCreate(store: Store, p: any): string {
   repo.issues.push(issue);
   repo.issueByNumber.set(issue.number, issue);
   bumpRepoCache(repo);
-  return rpcResult(null, issueObject(repo, issue.number));
+  return toolResult(id, issueObject(repo, issue.number));
 }
 
-function toolIssuesList(store: Store, p: any): string {
+function toolIssuesList(id: any, store: Store, p: any): string {
   const repo = findRepo(store, String(p.full_name || ""));
-  if (!repo) return rpcError(null, -32002, "Repository not found: " + p.full_name);
+  if (!repo) return rpcError(id, -32002, "Repository not found: " + p.full_name);
   const state = p.state !== undefined ? String(p.state) : "open";
   const out = repo.issues
     .filter((i: any) => state === "all" || i.state === state)
     .map((i: any) => issueObject(repo, i.number));
-  return rpcResult(null, out);
+  return toolResult(id, out);
 }
 
-function toolIssuesGet(store: Store, p: any): string {
+function toolIssuesGet(id: any, store: Store, p: any): string {
   const repo = findRepo(store, String(p.full_name || ""));
-  if (!repo) return rpcError(null, -32002, "Repository not found: " + p.full_name);
+  if (!repo) return rpcError(id, -32002, "Repository not found: " + p.full_name);
   const obj = issueObject(repo, Number(p.number));
-  if (!obj) return rpcError(null, -32002, "Issue not found: " + p.number);
-  return rpcResult(null, obj);
+  if (!obj) return rpcError(id, -32002, "Issue not found: " + p.number);
+  return toolResult(id, obj);
 }
 
-function toolIssuesComments(store: Store, p: any): string {
+function toolIssuesComments(id: any, store: Store, p: any): string {
   const repo = findRepo(store, String(p.full_name || ""));
-  if (!repo) return rpcError(null, -32002, "Repository not found: " + p.full_name);
+  if (!repo) return rpcError(id, -32002, "Repository not found: " + p.full_name);
   const issue = repo.issueByNumber.get(Number(p.number));
-  if (!issue) return rpcError(null, -32002, "Issue not found: " + p.number);
-  return rpcResult(null, issue.comments.map(commentObject));
+  if (!issue) return rpcError(id, -32002, "Issue not found: " + p.number);
+  return toolResult(id, issue.comments.map(commentObject));
 }
 
-function toolIssuesAddComment(store: Store, p: any): string {
+function toolIssuesAddComment(id: any, store: Store, p: any): string {
   const repo = findRepo(store, String(p.full_name || ""));
-  if (!repo) return rpcError(null, -32002, "Repository not found: " + p.full_name);
+  if (!repo) return rpcError(id, -32002, "Repository not found: " + p.full_name);
   const issue = repo.issueByNumber.get(Number(p.number));
-  if (!issue) return rpcError(null, -32002, "Issue not found: " + p.number);
+  if (!issue) return rpcError(id, -32002, "Issue not found: " + p.number);
   const comment = {
     id: store.nextCommentId++,
     user: store.viewer,
@@ -460,12 +467,12 @@ function toolIssuesAddComment(store: Store, p: any): string {
   issue.comments.push(comment);
   issue.updatedAt = store.nowIso;
   bumpRepoCache(repo);
-  return rpcResult(null, commentObject(comment));
+  return toolResult(id, commentObject(comment));
 }
 
-function toolPullsCreate(store: Store, p: any): string {
+function toolPullsCreate(id: any, store: Store, p: any): string {
   const repo = findRepo(store, String(p.full_name || ""));
-  if (!repo) return rpcError(null, -32002, "Repository not found: " + p.full_name);
+  if (!repo) return rpcError(id, -32002, "Repository not found: " + p.full_name);
   const title = String(p.title);
   const body = p.body !== undefined ? String(p.body) : "";
   const head = String(p.head);
@@ -488,43 +495,43 @@ function toolPullsCreate(store: Store, p: any): string {
   repo.pulls.push(pull);
   repo.pullByNumber.set(pull.number, pull);
   bumpRepoCache(repo);
-  return rpcResult(null, pullObject(repo, pull.number));
+  return toolResult(id, pullObject(repo, pull.number));
 }
 
-function toolPullsList(store: Store, p: any): string {
+function toolPullsList(id: any, store: Store, p: any): string {
   const repo = findRepo(store, String(p.full_name || ""));
-  if (!repo) return rpcError(null, -32002, "Repository not found: " + p.full_name);
+  if (!repo) return rpcError(id, -32002, "Repository not found: " + p.full_name);
   const state = p.state !== undefined ? String(p.state) : "open";
   const out = repo.pulls
     .filter((pl: any) => state === "all" || pl.state === state)
     .map((pl: any) => pullObject(repo, pl.number));
-  return rpcResult(null, out);
+  return toolResult(id, out);
 }
 
-function toolPullsGet(store: Store, p: any): string {
+function toolPullsGet(id: any, store: Store, p: any): string {
   const repo = findRepo(store, String(p.full_name || ""));
-  if (!repo) return rpcError(null, -32002, "Repository not found: " + p.full_name);
+  if (!repo) return rpcError(id, -32002, "Repository not found: " + p.full_name);
   const obj = pullObject(repo, Number(p.number));
-  if (!obj) return rpcError(null, -32002, "Pull not found: " + p.number);
-  return rpcResult(null, obj);
+  if (!obj) return rpcError(id, -32002, "Pull not found: " + p.number);
+  return toolResult(id, obj);
 }
 
-function toolPullsMerge(store: Store, p: any): string {
+function toolPullsMerge(id: any, store: Store, p: any): string {
   const repo = findRepo(store, String(p.full_name || ""));
-  if (!repo) return rpcError(null, -32002, "Repository not found: " + p.full_name);
+  if (!repo) return rpcError(id, -32002, "Repository not found: " + p.full_name);
   const pull = repo.pullByNumber.get(Number(p.number));
-  if (!pull) return rpcError(null, -32002, "Pull not found: " + p.number);
+  if (!pull) return rpcError(id, -32002, "Pull not found: " + p.number);
   if (pull.state !== "open") {
-    return rpcResult(null, { sha: null, merged: false, message: "Pull request is not open" });
+    return toolResult(id, { sha: null, merged: false, message: "Pull request is not open" });
   }
   const baseOid = repo.refs.get("refs/heads/" + pull.base);
   const headOid = repo.refs.get("refs/heads/" + pull.head);
   if (!baseOid || !headOid) {
-    return rpcResult(null, { sha: null, merged: false, message: "Branch not found" });
+    return toolResult(id, { sha: null, merged: false, message: "Branch not found" });
   }
   const lookup = (o: string) => repo.objects.get(o);
   if (!isAncestor(baseOid, headOid, lookup)) {
-    return rpcResult(null, { sha: null, merged: false, message: "Not an ancestor of the base" });
+    return toolResult(id, { sha: null, merged: false, message: "Not an ancestor of the base" });
   }
   const commitText =
     "tree " + treeOidOf(repo, headOid) + "\n" +
@@ -532,17 +539,19 @@ function toolPullsMerge(store: Store, p: any): string {
     "author Ada Iversen <adaiversen@example.invalid> 1700000000 +0000\n" +
     "committer Ada Iversen <adaiversen@example.invalid> 1700000000 +0000\n" +
     "\nMerge pull request #" + pull.number + "\n";
-  const mergeOid = store.hashObject("commit", Buffer.from(commitText, "utf8"));
+  const mergeOid = hashObject("commit", Buffer.from(commitText, "utf8"));
   repo.objects.set(mergeOid, { type: "commit", data: Buffer.from(commitText, "utf8") });
   repo.refs.set("refs/heads/" + pull.base, mergeOid);
   repo.headOid = mergeOid;
   repo.pushedAt = store.nowIso;
   repo.updatedAt = store.nowIso;
-  pull.state = "merged";
+  pull.merged = true;
+  pull.state = "closed";
+  pull.mergeCommitSha = mergeOid;
   pull.updatedAt = store.nowIso;
   pull.closedAt = store.nowIso;
   bumpRepoCache(repo);
-  return rpcResult(null, { sha: mergeOid, merged: true, message: "Pull request successfully merged" });
+  return toolResult(id, { sha: mergeOid, merged: true, message: "Pull request successfully merged" });
 }
 
 function treeOidOf(repo: Repo, commitOid: string): string {
@@ -553,24 +562,33 @@ function treeOidOf(repo: Repo, commitOid: string): string {
   return m ? m[1] : "0000000000000000000000000000000000000000";
 }
 
-function dispatchTool(store: Store, name: string, params: any): string {
+function dispatchTool(store: Store, id: any, name: string, params: any): string {
   const p = params && typeof params === "object" ? params : {};
+  const def = listTools().find((t: any) => t.name === name);
+  if (def) {
+    const required = Array.isArray(def.inputSchema && def.inputSchema.required) ? def.inputSchema.required : [];
+    for (const r of required) {
+      if (p[r] === undefined || p[r] === null || p[r] === "") {
+        return rpcError(id, -32602, "Missing required argument: " + r);
+      }
+    }
+  }
   switch (name) {
-    case "repos/create": return toolReposCreate(store, p);
-    case "repos/list": return toolReposList(store, p);
-    case "repos/get": return toolReposGet(store, p);
-    case "branches/list": return toolBranchesList(store, p);
-    case "commits/list": return toolCommitsList(store, p);
-    case "issues/create": return toolIssuesCreate(store, p);
-    case "issues/list": return toolIssuesList(store, p);
-    case "issues/get": return toolIssuesGet(store, p);
-    case "issues/comments": return toolIssuesComments(store, p);
-    case "issues/add_comment": return toolIssuesAddComment(store, p);
-    case "pulls/create": return toolPullsCreate(store, p);
-    case "pulls/list": return toolPullsList(store, p);
-    case "pulls/get": return toolPullsGet(store, p);
-    case "pulls/merge": return toolPullsMerge(store, p);
-    default: return rpcError(null, -32601, "Method not found: " + name);
+    case "repos/create": return toolReposCreate(id, store, p);
+    case "repos/list": return toolReposList(id, store, p);
+    case "repos/get": return toolReposGet(id, store, p);
+    case "branches/list": return toolBranchesList(id, store, p);
+    case "commits/list": return toolCommitsList(id, store, p);
+    case "issues/create": return toolIssuesCreate(id, store, p);
+    case "issues/list": return toolIssuesList(id, store, p);
+    case "issues/get": return toolIssuesGet(id, store, p);
+    case "issues/comments": return toolIssuesComments(id, store, p);
+    case "issues/add_comment": return toolIssuesAddComment(id, store, p);
+    case "pulls/create": return toolPullsCreate(id, store, p);
+    case "pulls/list": return toolPullsList(id, store, p);
+    case "pulls/get": return toolPullsGet(id, store, p);
+    case "pulls/merge": return toolPullsMerge(id, store, p);
+    default: return rpcError(id, -32601, "Method not found: " + name);
   }
 }
 
@@ -594,7 +612,7 @@ function handleRpc(store: Store, msg: RpcRequest): string {
     const params = msg.params || {};
     const name = params.name;
     const args = params.arguments || {};
-    return dispatchTool(store, name, args);
+    return dispatchTool(store, id, name, args);
   }
   return rpcError(id, -32601, "Method not found: " + method);
 }

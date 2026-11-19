@@ -279,6 +279,7 @@ async function dispatch(
   }
 
   if (first === 'mcp') {
+    if (!tokenOk(token)) { sendJson(res, 401, { message: 'Bad credentials' }); return; }
     await handleMcp({ method, body: '', token, headers: req.headers, store } as McpArgs, req, res);
     return;
   }

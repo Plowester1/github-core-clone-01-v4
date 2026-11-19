@@ -723,7 +723,8 @@ function issuesList(store: Store, args: RestArgs, requestId: string): RestResult
     const aTime = sort === 'updated' ? a.updatedAt : a.createdAt;
     const bTime = sort === 'updated' ? b.updatedAt : b.createdAt;
     const cmp = aTime < bTime ? -1 : aTime > bTime ? 1 : 0;
-    return direction === 'asc' ? cmp : -cmp;
+    if (cmp !== 0) return direction === 'asc' ? cmp : -cmp;
+    return direction === 'asc' ? a.number - b.number : b.number - a.number;
   });
   return sendJson(requestId, 200, ordered.map((issue) => issueJson(store, issue)));
 }
