@@ -4,6 +4,7 @@ import {
   isoOf,
 } from './store.ts';
 import { repoHeadOid, collectReachable } from './git.ts';
+import { treeOf, diffTrees } from './rest.ts';
 
 export const GRAPHQL_PATH = '/api/graphql';
 
@@ -359,7 +360,13 @@ function parseDocument(src: string, variables: Map<string, unknown>): OpNode {
 
 type StoreType = Store;
 
+function repoGid(repo: any): string { return `R${repo.id}`; }
+function issueGid(issue: any): string { return `I${issue.id}`; }
+function pullGid(pull: any): string { return `P${pull.id}`; }
+function commentGid(c: any): string { return `C${c.id}`; }
+
 function repoById(store: Store, id: string): any {
+  if (id.startsWith('R')) id = id.slice(1);
   for (const r of store.repos.values()) {
     if (String(r.id) === id) return r;
   }
@@ -413,7 +420,7 @@ function resolveComment(c: any): any {
   if (!c) return null;
   return {
     __gqlType: 'Comment',
-    id: String(c.id),
+    id: commentGid(c),
     user: resolveUser(c.user),
     createdAt: c.createdAt,
     updatedAt: c.updatedAt,
@@ -426,7 +433,7 @@ function resolveIssue(issue: any): any {
   if (!issue) return null;
   return {
     __gqlType: 'Issue',
-    id: String(issue.id),
+    id: issueGid(issue),
     number: issue.number,
     author: resolveUser(issue.user),
     user: resolveUser(issue.user),
@@ -445,7 +452,7 @@ function resolvePull(pull: any): any {
   if (!pull) return null;
   return {
     __gqlType: 'PullRequest',
-    id: String(pull.id),
+    id: pullGid(pull),
     number: pull.number,
     author: resolveUser(pull.user),
     user: resolveUser(pull.user),
@@ -460,6 +467,8 @@ function resolvePull(pull: any): any {
     baseRefName: pull.base,
     head: pull.head,
     base: pull.base,
+    merged: !!pull.merged,
+    mergeable: pull.mergeable || 'MERGEABLE',
     comments: connectionPage(pull.comments || [], null, null, resolveComment),
   };
 }
@@ -468,17 +477,21 @@ function resolveRepo(repo: any): any {
   if (!repo) return null;
   return {
     __gqlType: 'Repository',
+    id: repoGid(repo),
+    databaseId: repo.id,
     name: repo.name,
     fullName: repo.fullName,
+    nameWithOwner: repo.fullName,
     description: repo.description,
     isPrivate: repo.private,
     private: repo.private,
+    viewerPermission: 'ADMIN',
+    hasIssuesEnabled: true,
     defaultBranchRef: repo.defaultBranch ? { __gqlType: 'Ref', name: repo.defaultBranch, oid: repo.headOid } : null,
     createdAt: repo.createdAt,
     updatedAt: repo.updatedAt,
     pushedAt: repo.pushedAt,
     size: repo.size,
-    databaseId: repo.id,
   };
 }
 
@@ -510,7 +523,33 @@ function resolveField(field: FieldNode, ctx: { store: Store; parent: any; parent
     case 'Repository': {
       const repo = parent;
       switch (name) {
-        case 'owner': return { login: repo.owner };
+        case 'id': return repoGid(repo);
+        case 'databaseId': return repo.id;
+        case 'name': return repo.name;
+        case 'fullName': return repo.fullName;
+        case 'nameWithOwner': return repo.fullName;
+        case 'owner': return { login: repo.owner, __gqlType: 'User' };
+        case 'defaultBranchRef': return { name: repo.defaultBranch, oid: repo.headOid, __gqlType: 'Ref' };
+        case 'viewerPermission': return 'ADMIN';
+        case 'hasIssuesEnabled': return true;
+        case 'issue': {
+          const number = Number(field.args.number);
+          const issue = repo.issueByNumber.get(number) || repo.issues.find((i: any) => i.number === number);
+          return resolveIssue(issue || null);
+        }
+        case 'pullRequest': {
+          const number = Number(field.args.number);
+          const pull = repo.pullByNumber.get(number) || repo.pulls.find((p: any) => p.number === number);
+          if (pull) {
+            const resolved = resolvePull(pull);
+            const baseTree = treeOf(repo, pull.base);
+            const headTree = treeOf(repo, pull.head);
+            const diffs = diffTrees(store, repo, baseTree, headTree);
+            resolved.files = { nodes: diffs.map((diff) => ({ path: diff.path, __gqlType: 'PullRequestChangedFile' })) };
+            return resolved;
+          }
+          return resolvePull(null);
+        }
         case 'issues': {
           const first = field.args.first != null ? Number(field.args.first) : null;
           const after = field.args.after != null ? String(field.args.after) : null;
@@ -519,6 +558,7 @@ function resolveField(field: FieldNode, ctx: { store: Store; parent: any; parent
           if (Array.isArray(states)) {
             list = list.filter((i: any) => states.some((s: any) => String(s).toUpperCase() === i.state.toUpperCase()));
           }
+          list = [...list].sort((a: any, b: any) => (b.number - a.number));
           return { ...connectionPage(list, first, after, resolveIssue), repo };
         }
         case 'pullRequests': {
@@ -529,6 +569,7 @@ function resolveField(field: FieldNode, ctx: { store: Store; parent: any; parent
           if (Array.isArray(states)) {
             list = list.filter((p: any) => states.some((s: any) => String(s).toUpperCase() === p.state.toUpperCase()));
           }
+          list = [...list].sort((a: any, b: any) => (b.number - a.number));
           return { ...connectionPage(list, first, after, resolvePull), repo };
         }
         case 'refs':
@@ -552,6 +593,7 @@ function resolveField(field: FieldNode, ctx: { store: Store; parent: any; parent
           throw new Error('unknown Repository field ' + name);
       }
     }
+    case 'Ref': return resolveSubObject(parent, name, 'Ref');
     case 'Issue': return resolveSubObject(parent, name, 'Issue');
     case 'PullRequest': return resolveSubObject(parent, name, 'PullRequest');
     case 'User': return resolveSubObject(parent, name, 'User');
@@ -641,12 +683,13 @@ function resolveQueryField(field: FieldNode, store: Store): any {
       const id = String(field.args.id || '');
       const r = repoById(store, id);
       if (r) return resolveRepo(r);
+      const key = id.startsWith('I') || id.startsWith('P') ? id.slice(1) : id;
       for (const repo of store.repos.values()) {
         for (const issue of repo.issues || []) {
-          if (String(issue.id) === id) return resolveIssue(issue);
+          if (String(issue.id) === key) return resolveIssue(issue);
         }
         for (const pull of repo.pulls || []) {
-          if (String(pull.id) === id) return resolvePull(pull);
+          if (String(pull.id) === key) return resolvePull(pull);
         }
       }
       return null;
@@ -784,7 +827,8 @@ function resolveMutationField(field: FieldNode, store: Store): any {
       return result;
     }
     case 'addComment': {
-      const id = String(input.issueId || input.subjectId || '');
+      let id = String(input.issueId || input.subjectId || '');
+      if (id.startsWith('I')) id = id.slice(1);
       let found: any = null;
       let repo: any = null;
       for (const r of store.repos.values()) {
@@ -807,7 +851,27 @@ function resolveMutationField(field: FieldNode, store: Store): any {
       };
       found.comments.push(comment);
       bumpRepoCache(repo);
-      return { comment: resolveComment(comment), subject: resolveIssue(found) };
+      return { commentEdge: { node: resolveComment(comment) }, subject: resolveIssue(found) };
+    }
+    case 'mergePullRequest': {
+      const id = String(input.pullRequestId || input.id || '');
+      const target = input.pullRequestId != null ? String(input.pullRequestId) : String(input.id || '');
+      const pId = target.startsWith('P') ? target.slice(1) : target;
+      let found: any = null;
+      let repo: any = null;
+      for (const r of store.repos.values()) {
+        for (const pull of r.pulls || []) {
+          if (String(pull.id) === pId || String(pull.number) === pId) { found = pull; repo = r; break; }
+        }
+        if (found) break;
+      }
+      if (!found) throw new Error('pull request not found');
+      found.state = 'merged';
+      found.merged = true;
+      found.updatedAt = store.nowIso;
+      found.closedAt = store.nowIso;
+      bumpRepoCache(repo);
+      return { pullRequest: resolvePull(found) };
     }
     default:
       throw new Error('unknown mutation field ' + name);
@@ -815,7 +879,8 @@ function resolveMutationField(field: FieldNode, store: Store): any {
 }
 
 function mutateIssueState(store: Store, input: any, state: string): any {
-  const id = String(input.issueId || input.id || '');
+  let id = String(input.issueId || input.id || '');
+  if (id.startsWith('I')) id = id.slice(1);
   let found: any = null;
   let repo: any = null;
   for (const r of store.repos.values()) {
@@ -840,6 +905,8 @@ const TYPES = [
   'Comment', 'RepositoryConnection', 'IssueConnection', 'PullRequestConnection',
   'RefConnection', 'CommentConnection', 'SearchResultItemConnection', 'PageInfo',
   'IssueEdge', 'PullRequestEdge', 'RepositoryEdge', 'String', 'Int', 'Boolean', 'ID',
+  'Ref', 'PullRequestChangedFile', 'SearchType', 'IssueState', 'PullRequestState',
+  'MergeableState', 'PullRequestMergeMethod', 'OrderDirection', 'IssueOrderField',
 ];
 
 const KIND_OF: Record<string, string> = {
@@ -848,16 +915,19 @@ const KIND_OF: Record<string, string> = {
   RepositoryConnection: 'OBJECT', IssueConnection: 'OBJECT', PullRequestConnection: 'OBJECT',
   RefConnection: 'OBJECT', CommentConnection: 'OBJECT', SearchResultItemConnection: 'OBJECT',
   PageInfo: 'OBJECT', IssueEdge: 'OBJECT', PullRequestEdge: 'OBJECT', RepositoryEdge: 'OBJECT',
+  Ref: 'OBJECT', PullRequestChangedFile: 'OBJECT',
+  SearchType: 'ENUM', IssueState: 'ENUM', PullRequestState: 'ENUM',
+  MergeableState: 'ENUM', PullRequestMergeMethod: 'ENUM', OrderDirection: 'ENUM', IssueOrderField: 'ENUM',
   String: 'SCALAR', Int: 'SCALAR', Boolean: 'SCALAR', ID: 'SCALAR',
 };
 
 const TYPE_FIELDS: Record<string, string[]> = {
   Query: ['viewer', 'repository', 'node', 'search', 'issues', 'pullRequests', '__typename'],
-  Mutation: ['createIssue', 'createPullRequest', 'closeIssue', 'reopenIssue', 'addComment'],
-  Repository: ['id', 'name', 'fullName', 'description', 'isPrivate', 'private', 'defaultBranchRef', 'createdAt', 'updatedAt', 'pushedAt', 'size', 'databaseId', 'owner', 'issues', 'pullRequests', 'refs', 'branches', '__typename'],
+  Mutation: ['createIssue', 'createPullRequest', 'closeIssue', 'reopenIssue', 'addComment', 'mergePullRequest'],
+  Repository: ['id', 'databaseId', 'name', 'nameWithOwner', 'fullName', 'description', 'isPrivate', 'private', 'defaultBranchRef', 'viewerPermission', 'hasIssuesEnabled', 'issue', 'issues', 'pullRequest', 'pullRequests', 'createdAt', 'updatedAt', 'pushedAt', 'size', 'owner', 'refs', 'branches', '__typename'],
   User: ['id', 'login', 'name', 'email', 'createdAt', '__typename'],
   Issue: ['id', 'number', 'author', 'user', 'title', 'body', 'state', 'labels', 'createdAt', 'updatedAt', 'closedAt', 'comments', '__typename'],
-  PullRequest: ['id', 'number', 'author', 'user', 'title', 'body', 'state', 'labels', 'createdAt', 'updatedAt', 'closedAt', 'comments', 'headRefName', 'baseRefName', 'head', 'base', '__typename'],
+  PullRequest: ['id', 'number', 'author', 'user', 'title', 'body', 'state', 'merged', 'mergeable', 'files', 'labels', 'createdAt', 'updatedAt', 'closedAt', 'comments', 'headRefName', 'baseRefName', 'head', 'base', '__typename'],
   Label: ['id', 'name', 'color', 'description', '__typename'],
   Comment: ['id', 'user', 'author', 'createdAt', 'updatedAt', 'body', '__typename'],
   RepositoryConnection: ['nodes', 'edges', 'pageInfo', 'totalCount', '__typename'],
@@ -870,6 +940,8 @@ const TYPE_FIELDS: Record<string, string[]> = {
   IssueEdge: ['node', 'cursor', '__typename'],
   PullRequestEdge: ['node', 'cursor', '__typename'],
   RepositoryEdge: ['node', 'cursor', '__typename'],
+  Ref: ['name', 'oid', 'target', '__typename'],
+  PullRequestChangedFile: ['path', 'additions', 'deletions', '__typename'],
 };
 
 const FIELD_TYPE: Record<string, [string, boolean, boolean]> = {};
@@ -920,6 +992,8 @@ function ofType(t: string, list: boolean): any {
 
 function introspectType(name: string): any | null {
   if (!KIND_OF[name]) return null;
+  const isEnum = KIND_OF[name] === 'ENUM';
+  const enumNames: string[] = isEnum ? (ENUM_VALUES[name] || []) : [];
   return {
     kind: KIND_OF[name],
     name,
@@ -936,10 +1010,22 @@ function introspectType(name: string): any | null {
       : null,
     inputFields: null,
     interfaces: [],
-    enumValues: null,
+    enumValues: isEnum
+      ? enumNames.map((e) => ({ name: e, description: null, isDeprecated: false, deprecationReason: null }))
+      : null,
     possibleTypes: null,
   };
 }
+
+const ENUM_VALUES: Record<string, string[]> = {
+  SearchType: ['ISSUE', 'REPOSITORY', 'USER', 'CODE', 'COMMIT'],
+  IssueState: ['OPEN', 'CLOSED'],
+  PullRequestState: ['OPEN', 'CLOSED', 'MERGED'],
+  MergeableState: ['MERGEABLE', 'CONFLICTING', 'UNKNOWN'],
+  PullRequestMergeMethod: ['MERGE', 'SQUASH', 'REBASE'],
+  OrderDirection: ['ASC', 'DESC'],
+  IssueOrderField: ['CREATED_AT', 'UPDATED_AT', 'COMMENTS'],
+};
 
 function resolveType(name: string, field: FieldNode): any {
   const t = introspectType(name);
@@ -1170,6 +1256,23 @@ function collectVariables(body: any): Map<string, unknown> {
   return vars;
 }
 
+function executeOne(store: Store, entry: any): Record<string, unknown> {
+  const q = (entry && entry.query) || '';
+  const variables = collectVariables(entry || {});
+  if (!q || !q.trim()) {
+    return { errors: [{ message: 'Must provide query string.' }] };
+  }
+  try {
+    const op = parseDocument(q, variables);
+    if (op.op === 'mutation') {
+      return { data: stripTypes(executeSelection(op.fields, {}, 'Mutation', store)) };
+    }
+    return { data: stripTypes(executeSelection(op.fields, {}, 'Query', store)) };
+  } catch (e: any) {
+    return { errors: [{ message: (e && e.message) || String(e) }] };
+  }
+}
+
 export async function handleGraphQL(args: GraphQLArgs, req: any, res: any): Promise<void> {
   const store = args.store;
   let query: string = '';
@@ -1195,6 +1298,14 @@ export async function handleGraphQL(args: GraphQLArgs, req: any, res: any): Prom
         parsed = JSON.parse(args.body || '');
       } catch (e: any) {
         writeReply(res, 200, { errors: [{ message: 'JSON parse error: ' + (e && e.message || 'bad JSON') }] });
+        return;
+      }
+      if (Array.isArray(parsed)) {
+        const responses: any[] = [];
+        for (const entry of parsed) {
+          responses.push(executeOne(store, entry));
+        }
+        writeReply(res, 200, responses);
         return;
       }
       query = (parsed && parsed.query) || '';
