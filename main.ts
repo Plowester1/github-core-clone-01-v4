@@ -6,10 +6,14 @@ import type { User, Repo } from './store.ts';
 import {
   advertiseV0,
   advertiseV2,
+  decodePktLines,
+  encodePktLine,
   fetchResponse,
   lsRefsV2,
   parseFetchRequest,
   parseLsRefsRequest,
+  parsePushRequest,
+  pktFlush,
   receivePack,
 } from './git.ts';
 import type { GitService } from './git.ts';
@@ -111,21 +115,30 @@ async function handleGit(
   res: { writeHead: (code: number, headers: Record<string, string | number>) => void; end: (data: Buffer | string) => void },
   service: GitService,
 ): Promise<void> {
-  const baseSegs = segs.filter((s) => !s.endsWith('.git'));
-  const operation = segs.length > MI ? segs[MI] : '';
+  const baseSegs = segs.map((s) => (s.endsWith('.git') ? s.slice(0, -4) : s));
+  const owner = baseSegs[0] ?? '';
+  const name = baseSegs[1] ?? '';
+  const repo = store.getRepo(`${owner}/${name}`);
+  const operation = segs[2] === 'info' && segs[3] === 'refs'
+    ? 'info/refs'
+    : (segs[2] ?? '');
+  if (!repo) {
+    sendJson(res, 404, { message: 'Not Found' });
+    return;
+  }
   if (operation === 'info/refs') {
     const q = new URL(req.url ?? url, 'http://x').searchParams;
     const serviceParam = q.get('service');
     const gitProtocol = req.headers['git-protocol'] ?? '';
     let advertised: Buffer;
     if (serviceParam === 'git-upload-pack' && gitProtocol === 'version=2') {
-      advertised = advertiseV2(store, baseSegs[0], baseSegs[1]);
+      advertised = advertiseV2(repo, 'git-upload-pack');
     } else if (serviceParam === 'git-upload-pack') {
-      advertised = advertiseV0(store, baseSegs[0], baseSegs[1], 'git-upload-pack');
+      advertised = advertiseV0(repo, 'git-upload-pack');
     } else if (serviceParam === 'git-receive-pack') {
-      advertised = advertiseV0(store, baseSegs[0], baseSegs[1], 'git-receive-pack');
+      advertised = advertiseV0(repo, 'git-receive-pack');
     } else {
-      advertised = advertiseV0(store, baseSegs[0], baseSegs[1], 'git-upload-pack');
+      advertised = advertiseV0(repo, 'git-upload-pack');
     }
     const headers: Record<string, string | number> = {
       'content-type': `application/x-${serviceParam ?? 'git-upload-pack'}-advertisement`,
@@ -138,8 +151,13 @@ async function handleGit(
   }
   if (operation === 'git-upload-pack') {
     const body = await readBody(req as never, res as never);
-    const parsed = parseFetchRequest(body);
-    const resp = await fetchResponse(store, baseSegs[0], baseSegs[1], parsed);
+    const packets = decodePktLines(body);
+    const hasLsRefs = packets.some(
+      (packet) => packet.kind === 'data' && packet.payload.toString('utf8').replace(/\n$/, '') === 'command=ls-refs',
+    );
+    const resp = hasLsRefs
+      ? lsRefsV2(repo, parseLsRefsRequest(packets))
+      : fetchResponse(repo, parseFetchRequest(packets));
     const headers: Record<string, string | number> = {
       'content-type': `application/x-git-upload-pack-result`,
       'content-length': resp.length,
@@ -150,15 +168,16 @@ async function handleGit(
   }
   if (operation === 'git-receive-pack') {
     const body = await readBody(req as never, res as never);
-    const report = await receivePack(store, baseSegs[0], baseSegs[1], body, {
-      userLogin: VIEWER_LOGIN,
-    });
+    const { commands, packStart } = parsePushRequest(body);
+    const report = receivePack(repo, commands, body.subarray(packStart));
+    const reportBytes = encodePushReport(report);
+    const framed = sidebandBand1(reportBytes);
     const headers: Record<string, string | number> = {
       'content-type': `application/x-git-receive-pack-result`,
-      'content-length': report.length,
+      'content-length': framed.length,
     };
     res.writeHead(200, headers);
-    res.end(report);
+    res.end(framed);
     return;
   }
   if (operation === 'git-upload-pack' || operation === 'info/refs') {
@@ -167,7 +186,32 @@ async function handleGit(
   sendJson(res, 404, { message: 'Not Found' });
 }
 
-const MI = 2;
+/** Frame a receive-pack report-status into band-1 sideband packets. */
+function sidebandBand1(report: Buffer): Buffer {
+  const max = 65515;
+  const parts: Buffer[] = [];
+  for (let offset = 0; offset < report.length; offset += max) {
+    const chunk = report.subarray(offset, Math.min(offset + max, report.length));
+    const payload = Buffer.allocUnsafe(1 + chunk.length);
+    payload[0] = 1;
+    chunk.copy(payload, 1);
+    parts.push(encodePktLine(payload));
+  }
+  parts.push(pktFlush());
+  return Buffer.concat(parts);
+}
+
+/** Build the receive-pack report-status stream from a PushReport. */
+function encodePushReport(report: { unpackOk: boolean; unpackDetail: string; refs: ReadonlyArray<{ ref: string; ok: boolean; reason: string }> }): Buffer {
+  const lines: Buffer[] = [];
+  lines.push(encodePktLine(report.unpackOk ? 'unpack ok\n' : `unpack ${report.unpackDetail}\n`));
+  for (const ref of report.refs) {
+    if (ref.ok) lines.push(encodePktLine(`ok ${ref.ref}\n`));
+    else lines.push(encodePktLine(`ng ${ref.ref} ${ref.reason}\n`));
+  }
+  lines.push(pktFlush());
+  return Buffer.concat(lines);
+}
 
 function methodOf(req: { method?: string }): string {
   return (req.method ?? 'GET').toUpperCase();
@@ -272,11 +316,12 @@ async function dispatchRest(
     token,
     origin: '',
   };
-  const r = await handleRest(store, args);
+  const requestId = nextRequestId();
+  const r = await handleRest(store, args, requestId);
   const status = r.status;
   const headers: Record<string, string | number> = {
     'content-type': r.contentType ?? 'application/json',
-    'x-github-request-id': nextRequestId(),
+    'x-github-request-id': requestId,
   };
   if (r.headers) {
     for (const [k, v] of Object.entries(r.headers)) headers[k] = v;

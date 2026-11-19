@@ -512,7 +512,7 @@ export function advertiseV0(repo: Repo, service: GitService): Buffer {
   if (headOid && headOid !== ZERO_OID) {
     lines.push(encodePktLine(`${headOid} ${head}\u0000${caps.join(' ')} symref=HEAD:${head}\n`));
   } else {
-    lines.push(encodePktLine(`capabilities^{}\u0000${caps.join(' ')} symref=HEAD:${head}\n`));
+    lines.push(encodePktLine(`${ZERO_OID} capabilities^{}\u0000${caps.join(' ')} symref=HEAD:${head}\n`));
   }
   for (const ref of allRefs(repo)) {
     if (ref === head) continue;

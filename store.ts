@@ -56,6 +56,7 @@ export function buildTree(entries: TreeEntry[]): Buffer {
   for (const e of sorted) {
     const mode = e.mode.toString(8);
     parts.push(Buffer.from(`${mode} ${e.name}`, 'utf8'));
+    parts.push(Buffer.from([0x00]));
     parts.push(Buffer.from(e.oid, 'hex'));
   }
   return Buffer.concat(parts);

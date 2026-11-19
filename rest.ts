@@ -71,6 +71,7 @@ export interface NewRepo {
   description?: string;
   private?: boolean;
   defaultBranch?: string;
+  auto_init?: boolean;
 }
 
 /** Memoised serialization of a user so repeated replies stay cheap. */
@@ -232,8 +233,8 @@ function sortEntries(entries: TreeEntry[]): TreeEntry[] {
 }
 
 /** The viewer identity for author/committer/tagger lines. */
-function viewerIdentity(store: Store): { name: string; email: string; timestamp: number } {
-  return { name: VIEWER_NAME, email: VIEWER_EMAIL, timestamp: store.epochSec };
+function viewerIdentity(store: Store): string {
+  return `${VIEWER_NAME} <${VIEWER_EMAIL}> ${store.epochSec} +0000`;
 }
 
 /**
@@ -426,6 +427,10 @@ export function createRepo(store: Store, args: RestArgs, requestId: string): Res
     private: input.private === true,
     defaultBranch: typeof input.defaultBranch === 'string' && input.defaultBranch !== '' ? input.defaultBranch : 'main',
   });
+  if (input.auto_init === true) {
+    const emptyTree = putObject(repo, 'tree', buildTree([]));
+    putCommit(store, repo, repo.defaultBranch, emptyTree, [], 'Initial commit');
+  }
   return sendJson(requestId, 201, repoJson(store, repo));
 }
 
