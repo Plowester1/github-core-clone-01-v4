@@ -271,7 +271,7 @@ export function commitView(store: Store, repo: Repo, oid: string): Record<string
     sha: oid,
     node_id: oid,
     commit: {
-      message: commit.message,
+      message: commit.message.replace(/\n+$/, ''),
       tree: { sha: commit.tree },
       author: personOf(store, commit.author),
       committer: personOf(store, commit.committer),
@@ -421,10 +421,10 @@ export function createRepo(store: Store, args: RestArgs, requestId: string): Res
   const name = typeof input.name === 'string' ? input.name.trim() : '';
   if (name === '') return jsonError(requestId, 422, 'name is missing');
   const owner = store.viewer.login;
-  if (store.getRepo(`${owner}/${name}`)) return jsonError(requestId, 422, 'Repository creation failed.');
+  if (store.getRepo(`${owner}/${name}`)) return jsonError(requestId, 422, 'Repository already exists.');
   const repo = store.createRepo(owner, name, {
     description: typeof input.description === 'string' ? input.description : '',
-    private: input.private === true,
+    isPrivate: input.private === true,
     defaultBranch: typeof input.defaultBranch === 'string' && input.defaultBranch !== '' ? input.defaultBranch : 'main',
   });
   if (input.auto_init === true) {

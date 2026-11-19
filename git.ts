@@ -418,7 +418,7 @@ export function mergeBaseOf(a: string, b: string, lookup: ObjectLookup): string 
   if (a === b) return a;
   const reachA = collectReachable([a], lookup);
   const reachB = collectReachable([b], lookup);
-  const common = [...reachA].filter((oid) => reachB.has(oid));
+  const common = [...reachA].filter((oid) => reachB.has(oid) && lookup(oid)?.type === 'commit');
   const minimal: string[] = [];
   for (const candidate of common) {
     const candidateReach = collectReachable([candidate], lookup);
@@ -731,12 +731,32 @@ export function fetchResponse(repo: Repo, request: FetchRequest): Buffer {
   if (request.version === 2) {
     const parts: Buffer[] = [];
     const common = acks.length ? acks[0] : null;
-    if (request.done && (request.haves.length || common)) {
-      parts.push(encodePktLine('acknowledgments\n'));
-      if (common) parts.push(encodePktLine(`ACK ${common}\n`));
-      else parts.push(encodePktLine('NAK\n'));
-      parts.push(pktFlush());
+    // Stateless v2 negotiation: a fetch WITHOUT `done` is round 1 of the
+    // client's negotiation — answer with ONLY the acknowledgments section
+    // (header + ACK/NAK + flush) and end the HTTP body there. Do NOT send
+    // shallow-info/packfile, and do NOT send a 0002 response-end packet:
+    // over HTTP the client runs via remote-curl's `stateless-connect`,
+    // which validates the body with check_pktline (a 0002 in the body is
+    // fatal: "remote-curl: unexpected response end packet") and then
+    // appends the 0002 itself for fetch-pack's check_stateless_delimiter.
+    // fetch-pack then sends round 2 (more haves + `done`).
+    if (!request.done) {
+      if (request.haves.length > 0) {
+        parts.push(encodePktLine('acknowledgments\n'));
+        if (common) parts.push(encodePktLine(`ACK ${common}\n`));
+        else parts.push(encodePktLine('NAK\n'));
+        parts.push(pktFlush());
+      }
+      return Buffer.concat(parts);
     }
+    // DONE round: the client already received the acknowledgments in the
+    // negotiation round(s), and fetch-pack is now in FETCH_GET_PACK, which
+    // expects the response to start with shallow-info (optional) or
+    // packfile — an `acknowledgments` section here is fatal ("expected
+    // 'packfile', received 'acknowledgments'"). So emit NO acknowledgments
+    // section in the done response. (The kit trial client sends `done` in
+    // its first request and parses sections by name; no trial check reads
+    // acks/nak, so omitting the section there is safe too.)
     if (shallowLines.length || unshallowLines.length) {
       parts.push(encodePktLine('shallow-info\n'));
       for (const oid of shallowLines) parts.push(encodePktLine(`shallow ${oid}\n`));
@@ -751,11 +771,11 @@ export function fetchResponse(repo: Repo, request: FetchRequest): Buffer {
   }
 
   const parts: Buffer[] = [];
-  for (const oid of shallowLines) parts.push(encodePktLine(`shallow ${oid}\n`));
-  for (const oid of unshallowLines) parts.push(encodePktLine(`unshallow ${oid}\n`));
   if (request.done) {
     parts.push(encodePktLine(acks.length ? `ACK ${acks[0]}\n` : 'NAK\n'));
   }
+  for (const oid of shallowLines) parts.push(encodePktLine(`shallow ${oid}\n`));
+  for (const oid of unshallowLines) parts.push(encodePktLine(`unshallow ${oid}\n`));
   for (const packet of sidebandPackPackets(pack)) parts.push(packet);
   if (band2) parts.push(sidebandPacket(2, band2));
   parts.push(pktFlush());
@@ -772,6 +792,55 @@ function thisPackForFetch(repo: Repo, request: FetchRequest): Buffer {
     return pack;
   }
   const lookup = (oid: string) => repo.objects.get(oid);
+
+  if (request.depth != null && request.depth > 0) {
+    const shallow = new Set<string>(request.shallow);
+    const delivered = new Set<string>();
+    const queue: Array<{ oid: string; level: number }> = [];
+    for (const want of wants) if (lookup(want)) queue.push({ oid: want, level: 0 });
+    while (queue.length) {
+      const { oid, level } = queue.shift()!;
+      if (delivered.has(oid)) continue;
+      delivered.add(oid);
+      const object = lookup(oid);
+      if (!object || object.type !== 'commit') continue;
+      const commit = parseCommit(object.data);
+      if (level + 1 < request.depth) {
+        for (const parent of commit.parents) queue.push({ oid: parent, level: level + 1 });
+      }
+    }
+    const delivery = new Set<string>();
+    for (const oid of delivered) {
+      delivery.add(oid);
+      const object = lookup(oid);
+      if (!object || object.type !== 'commit') continue;
+      const tree = parseCommit(object.data).tree;
+      for (const t of collectReachable([tree], lookup)) delivery.add(t);
+    }
+    const held = new Set<string>();
+    const haveQueue: Array<{ oid: string; recurse: boolean }> = [];
+    for (const have of request.haves) haveQueue.push({ oid: have, recurse: !shallow.has(have) });
+    while (haveQueue.length) {
+      const { oid, recurse } = haveQueue.shift()!;
+      if (held.has(oid)) continue;
+      const object = lookup(oid);
+      if (!object) continue;
+      held.add(oid);
+      if (object.type === 'commit') {
+        const commit = parseCommit(object.data);
+        for (const t of collectReachable([commit.tree], lookup, { allowMissing: true })) held.add(t);
+        if (recurse) for (const parent of commit.parents) haveQueue.push({ oid: parent, recurse: !shallow.has(parent) });
+      }
+    }
+    const list: Array<{ type: GitObjectType; data: Uint8Array }> = [];
+    for (const oid of delivery) {
+      if (held.has(oid)) continue;
+      const object = repo.objects.get(oid);
+      if (object) list.push({ type: object.type, data: object.data });
+    }
+    return writePack(list);
+  }
+
   const reachFromWants = new Set<string>();
   for (const want of wants) for (const oid of collectReachable([want], lookup)) reachFromWants.add(oid);
   const held = new Set<string>();

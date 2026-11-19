@@ -315,7 +315,7 @@ async function dispatchRest(
     query: u.searchParams,
     body: bodyStr,
     token,
-    origin: '',
+    origin: req.headers.host ? `http://${req.headers.host}` : '',
   };
   const requestId = nextRequestId();
   const r = await handleRest(store, args, requestId);

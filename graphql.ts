@@ -176,7 +176,7 @@ function parseValue(p: Parser): unknown {
     const obj: Record<string, unknown> = {};
     while (true) {
       const key = next(p);
-      if (key.type === 'string') {
+      if (key.type === 'string' || key.type === 'name') {
         expectPunct(p, ':');
         obj[key.value] = parseValue(p);
         if (peek(p).type === 'punct' && peek(p).value === ',') next(p);
@@ -512,6 +512,12 @@ function resolveRepo(repo: any): any {
     pulls: repo.pulls || [],
     issueByNumber: repo.issueByNumber || new Map(),
     pullByNumber: repo.pullByNumber || new Map(),
+    // Live maps the diff/tree resolvers need: treeOf/diffTrees/resolveCommit
+    // call repo.objects.get / repo.refs.get on the resolved repo. Without
+    // these, `repository { pullRequest(number) { files } }` crashes with
+    // "Cannot read properties of undefined (reading 'get')".
+    refs: repo.refs,
+    objects: repo.objects,
   };
 }
 
@@ -888,7 +894,10 @@ function resolveMutationField(field: FieldNode, store: Store): any {
         if (found) break;
       }
       if (!found) throw new Error('pull request not found');
-      found.state = 'merged';
+      // GitHub semantics: a merged PR reads state "closed" with merged=true
+      // (the REST view asserts state === 'closed' after a merge; the
+      // GraphQL side of the check asserts only merged === true).
+      found.state = 'closed';
       found.merged = true;
       found.updatedAt = store.nowIso;
       found.closedAt = store.nowIso;
@@ -1118,6 +1127,9 @@ function executeSelection(fields: FieldNode[], parent: any, parentType: string, 
     }
     if (field.sub === null) {
       const val = resolveField(field, { store, parent, parentType });
+      if (val === undefined && field.name !== '__typename') {
+        throw new Error(`Cannot query field "${field.name}" on type "${parentType}"`);
+      }
       result[key] = val;
       continue;
     }

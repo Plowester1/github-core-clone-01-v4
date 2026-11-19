@@ -363,7 +363,7 @@ function toolReposCreate(id: any, store: Store, p: any): string {
   const name = String(p.name);
   const repo = store.createRepo(owner, name, {
     description: p.description !== undefined ? String(p.description) : undefined,
-    private: p.private !== undefined ? Boolean(p.private) : undefined,
+    isPrivate: p.private !== undefined ? Boolean(p.private) : undefined,
     defaultBranch: p.default_branch !== undefined ? String(p.default_branch) : undefined,
   });
   return toolResult(id, repoResult(repo));
